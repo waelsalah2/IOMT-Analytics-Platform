@@ -13,6 +13,7 @@ from aws_cdk import (
     aws_iam as iam,
     aws_kms as kms,
     aws_lambda as lambda_,
+    aws_lambda_event_sources as lambda_event_sources,
     aws_sqs as sqs,
     aws_iot as iot,
     aws_glue as glue,
@@ -54,12 +55,16 @@ class IoMTPlatformStack(Stack):
             removal_policy=RemovalPolicy.RETAIN,
         )
 
-        # Audit logging bucket
+        # Grant CloudTrail permission to use KMS key
+        self.encryption_key.grant_encrypt_decrypt(
+            iam.ServicePrincipal("cloudtrail.amazonaws.com")
+        )
+
+        # Audit logging bucket - use S3-managed encryption for CloudTrail compatibility
         self.audit_logs_bucket = s3.Bucket(
             self, "AuditLogsBucket",
             bucket_name=f"iomt-audit-logs-{self.account}-{self.region}",
-            encryption=s3.BucketEncryption.KMS,
-            encryption_key=self.encryption_key,
+            encryption=s3.BucketEncryption.S3_MANAGED,  # CloudTrail works better with S3-managed
             enforce_ssl=True,
             versioned=True,
             block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
@@ -77,11 +82,35 @@ class IoMTPlatformStack(Stack):
             ]
         )
 
-        # CloudTrail for audit logging
+        # Add bucket policy for CloudTrail
+        self.audit_logs_bucket.add_to_resource_policy(
+            iam.PolicyStatement(
+                sid="AWSCloudTrailAclCheck",
+                effect=iam.Effect.ALLOW,
+                principals=[iam.ServicePrincipal("cloudtrail.amazonaws.com")],
+                actions=["s3:GetBucketAcl"],
+                resources=[self.audit_logs_bucket.bucket_arn]
+            )
+        )
+        self.audit_logs_bucket.add_to_resource_policy(
+            iam.PolicyStatement(
+                sid="AWSCloudTrailWrite",
+                effect=iam.Effect.ALLOW,
+                principals=[iam.ServicePrincipal("cloudtrail.amazonaws.com")],
+                actions=["s3:PutObject"],
+                resources=[f"{self.audit_logs_bucket.bucket_arn}/AWSLogs/{self.account}/*"],
+                conditions={
+                    "StringEquals": {
+                        "s3:x-amz-acl": "bucket-owner-full-control"
+                    }
+                }
+            )
+        )
+
+        # CloudTrail for audit logging (without KMS to simplify permissions)
         self.trail = cloudtrail.Trail(
             self, "IoMTAuditTrail",
             bucket=self.audit_logs_bucket,
-            encryption_key=self.encryption_key,
             include_global_service_events=True,
             is_multi_region_trail=True,
             enable_file_validation=True,
@@ -200,7 +229,7 @@ class IoMTPlatformStack(Stack):
 
         # Add SQS trigger to FHIR converter
         self.fhir_converter_lambda.add_event_source(
-            lambda_.event_sources.SqsEventSource(
+            lambda_event_sources.SqsEventSource(
                 self.processing_queue,
                 batch_size=10,
             )
@@ -559,14 +588,15 @@ class IoMTPlatformStack(Stack):
             name="IoMTPatientEngagement"
         )
 
-        # Pinpoint Email Channel (requires verification in production)
-        self.pinpoint_email = pinpoint.CfnEmailChannel(
-            self, "PinpointEmailChannel",
-            application_id=self.pinpoint_app.ref,
-            from_address="noreply@iomt-platform.example.com",
-            identity="iomt-platform.example.com",
-            enabled=True
-        )
+        # NOTE: Pinpoint Email Channel requires a verified SES identity/domain
+        # To enable email, first verify your domain in SES, then uncomment:
+        # self.pinpoint_email = pinpoint.CfnEmailChannel(
+        #     self, "PinpointEmailChannel",
+        #     application_id=self.pinpoint_app.ref,
+        #     from_address="noreply@your-verified-domain.com",
+        #     identity="your-verified-domain.com",
+        #     enabled=True
+        # )
 
         # =================================================================
         # FHIR API (API Gateway)
